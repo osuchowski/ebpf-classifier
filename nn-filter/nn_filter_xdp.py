@@ -166,9 +166,12 @@ int nn1(struct xdp_md *ctx) {
   s_x_inv = *((int*)layer_2_s_x_inv.lookup_or_init(&_zero, &_zero));
   scale_factor_int = (s_x + ROUND_CONST) >> FXP_VALUE;
   scale_factor_frac = s_x - (scale_factor_int << FXP_VALUE);
+  // bpf_trace_printk("nn1 (scale): %d %d ", s_x, (scale_factor_int << FXP_VALUE));
+  // bpf_trace_printk("nn1 (scale_factor_int): %d %d ", scale_factor_int, scale_factor_frac);
   for (m = 0; m < H1; m++) {
     _m = m;
     out = *out_input.lookup_or_init(&_m, &_zero64);
+    // bpf_trace_printk("nn1: x_q[%d]=%d %d", _m, x_q[m], out);
     tensor_int = (out + ROUND_CONST) >> FXP_VALUE;
     if (tensor_int > INT8_MAX_VALUE*s_x_inv) {
       x_q[m] = (int8_t)INT8_MAX_VALUE;
@@ -181,6 +184,7 @@ int nn1(struct xdp_md *ctx) {
       rounded_value = ((rounded_value + ROUND_CONST) >> FXP_VALUE) + tensor_int*scale_factor_int;
       x_q[m] = (int8_t)rounded_value; /* store quantized value in output tensor */
     }
+    // bpf_trace_printk("nn1 (x_q[%d]): %d ", _m, x_q[m]);
   }
   // mat_mult(x_q, w, output, dimension_layer);
   for (m = 0; m < H2; m++) {
@@ -194,6 +198,7 @@ int nn1(struct xdp_md *ctx) {
     _m = m;
     // s_w_inv = *((int*)layer_2_s_w_inv.lookup_or_init(&_m, &_zero));
     out_value = *layer_2_s_w_inv.lookup_or_init(&_m, &_zero);
+    out_value *= s_x_inv;
     // out_value = s_w_inv * s_x_inv;
     out = (int64_t)accumulator;
     if (out_value > (1 << FXP_VALUE)) {
@@ -202,6 +207,7 @@ int nn1(struct xdp_md *ctx) {
     else {
       out = (out_value*out + ROUND_CONST) >> FXP_VALUE;
     }
+    // bpf_trace_printk("nn1: %d %d", _m, out);
     // relu(output, N*M);
     out = MAX(out, 0);
     out_input2.update(&_m, &out);
@@ -250,6 +256,7 @@ int nn2(struct xdp_md *ctx) {
     // s_w_inv = *((int*)layer_3_s_w_inv.lookup_or_init(&_m, &_zero));
     out_value = *layer_3_s_w_inv.lookup_or_init(&_m, &_zero);
     // out_value = s_w_inv * s_x_inv;
+    out_value *= s_x_inv;
     out = (int64_t)accumulator;
     if (out_value > (1 << FXP_VALUE)) {
       out *= ((out_value + ROUND_CONST) >> FXP_VALUE);
@@ -261,6 +268,7 @@ int nn2(struct xdp_md *ctx) {
       argmax_over_cols = m; // return column
     }
   }
+  bpf_trace_printk("argmax_over_cols=%d", argmax_over_cols);
   if (argmax_over_cols != 0) {
     // return XDP_DROP;
     // jmp_table.call(ctx, 2);
@@ -270,7 +278,7 @@ int nn2(struct xdp_md *ctx) {
   vp = dropcnt.lookup_or_init(&_zero, &val);
   *vp += 1;
   // jmp_table.call(ctx, 2);
-  return XDP_DROP;
+  // return XDP_DROP;
   return XDP_PASS;
 }
 int nn_xdp_drop_packet(struct xdp_md *ctx) {
@@ -292,7 +300,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
   pkt_key.sport = 0;
   pkt_key.dport = 0;
 
-  bpf_trace_printk("RX queue id is %d\\n", ctx->rx_queue_index);
+  // bpf_trace_printk("RX queue id is %d\\n", ctx->rx_queue_index);
 
   ethernet: {
     if (data + nh_off > data_end) {
@@ -395,11 +403,12 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
         unsigned int _k = k;
         out = *data_min.lookup_or_init(&_k, &_zero64);
         _data_scale = *data_scale.lookup_or_init(&_k, &_zero64);
-        x[k] = (x[k] - out) * _data_scale;
+        x[k] = ((x[k] - out) * _data_scale) >> FXP_VALUE;
+        // bpf_trace_printk("scaled: %d %lld", k, x[k]);
       }
 
       int rounded_value, tensor_int, tensor_frac, scale_factor_int, scale_factor_frac, accumulator, s_w_inv, s_x, s_x_inv, out_value;
-      int8_t weight, x_q[INPUT_DIM];
+      int8_t weight, x_q[INPUT_DIM] = {0};
 
       // linear_layer(x, layer_1_weight, out_input, layer_1_s_w_inv, dimension_layer1);
       // quantize(x, x_q, x_scale_factor, x_scale_factor_inv, N*INPUT_DIM);
@@ -407,6 +416,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
       s_x_inv = *((int*)layer_1_s_x_inv.lookup_or_init(&_zero, &_zero));
       scale_factor_int = (s_x + ROUND_CONST) >> FXP_VALUE;
       scale_factor_frac = s_x - (scale_factor_int << FXP_VALUE);
+        // bpf_trace_printk("nn0 (scale): %d %d ", s_x, s_x_inv);
       for (m = 0; m < INPUT_DIM; m++) {
         tensor_int = (x[m] + ROUND_CONST) >> FXP_VALUE;
         if (tensor_int > INT8_MAX_VALUE*s_x_inv) {
@@ -420,6 +430,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
           rounded_value = ((rounded_value + ROUND_CONST) >> FXP_VALUE) + tensor_int*scale_factor_int;
           x_q[m] = (int8_t)rounded_value; /* store quantized value in output tensor */
         }
+        // bpf_trace_printk("nn0: x_q[%d]=%d", m, x_q[m]);
       }
       // mat_mult(x_q, w, output, dimension_layer);
       for (m = 0; m < H1; m++) {
@@ -434,7 +445,9 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
         // s_w_inv = *((int*)layer_1_s_w_inv.lookup_or_init(&_m, &_zero));
         out_value = *layer_1_s_w_inv.lookup_or_init(&_m, &_zero);
         // out_value = s_w_inv * s_x_inv;
+        out_value *= s_x_inv;
         out = (int64_t)accumulator;
+        // bpf_trace_printk("nn0: acc[%d]=%d, out_value=%d", m, out, out_value);
         if (out_value > (1 << FXP_VALUE)) {
           out *= ((out_value + ROUND_CONST) >> FXP_VALUE);
         } else {
@@ -442,6 +455,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
         }
         // relu(output, N*H1);
         out = MAX(out, 0);
+        // bpf_trace_printk("nn0: out[%d]=%d", m, out);
         out_input.update(&_m, &out);
       }
       jmp_table.call(ctx, 0);
@@ -491,7 +505,7 @@ if __name__ == '__main__':
             offload_device = device.encode()
             flags |= BPF.XDP_FLAGS_HW_MODE
     prefix_path = "runs"
-    with open(f'{curdir}/mlp_params.json') as f:
+    with open(f"{curdir}/mlp_params.json") as f:
         params = json.load(f)
 
     bpf_text = bpf_text.replace('LAYER_1_S_W_INV', str(len(params["layer_1_s_w_inv"])))
@@ -565,22 +579,11 @@ if __name__ == '__main__':
                 time.sleep(1)
                 end = datetime.now()
                 for k, v in dropcnt.items():
-                    print(v.value)
+                    print(end, int(v.value / (end - start1).total_seconds()))
                     ret.append(int(v.value / (end - start1).total_seconds()))
                 duration = (end - start).total_seconds()
-                if duration > interval:
-                    break
             except KeyboardInterrupt:
                 break
     finally:
         b.remove_xdp(device, flags)
-        filename = f"{resdir}/rxpps.log"
-        if "-S" in sys.argv:
-            # XDP_FLAGS_SKB_MODE
-            filename = f"{resdir}/rxpps.log"
-        if "-D" in sys.argv:
-            filename = f"{resdir}/rxpps.log"
-        with open (filename, 'w') as f:
-            for d in ret:
-                f.write(f"{d}\n")
 
