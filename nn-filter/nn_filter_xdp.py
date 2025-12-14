@@ -194,6 +194,7 @@ int nn1(struct xdp_md *ctx) {
     _m = m;
     // s_w_inv = *((int*)layer_2_s_w_inv.lookup_or_init(&_m, &_zero));
     out_value = *layer_2_s_w_inv.lookup_or_init(&_m, &_zero);
+    out_value *= s_x_inv;
     // out_value = s_w_inv * s_x_inv;
     out = (int64_t)accumulator;
     if (out_value > (1 << FXP_VALUE)) {
@@ -249,6 +250,7 @@ int nn2(struct xdp_md *ctx) {
     _m = m;
     // s_w_inv = *((int*)layer_3_s_w_inv.lookup_or_init(&_m, &_zero));
     out_value = *layer_3_s_w_inv.lookup_or_init(&_m, &_zero);
+    out_value *= s_x_inv;
     // out_value = s_w_inv * s_x_inv;
     out = (int64_t)accumulator;
     if (out_value > (1 << FXP_VALUE)) {
@@ -261,6 +263,8 @@ int nn2(struct xdp_md *ctx) {
       argmax_over_cols = m; // return column
     }
   }
+  bpf_trace_printk("nn output %u\\n", argmax_over_cols);
+
   if (argmax_over_cols != 0) {
     // return XDP_DROP;
     // jmp_table.call(ctx, 2);
@@ -292,7 +296,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
   pkt_key.sport = 0;
   pkt_key.dport = 0;
 
-  bpf_trace_printk("RX queue id is %d\\n", ctx->rx_queue_index);
+  // bpf_trace_printk("RX queue id is %d\\n", ctx->rx_queue_index);
 
   ethernet: {
     if (data + nh_off > data_end) {
@@ -395,7 +399,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
         unsigned int _k = k;
         out = *data_min.lookup_or_init(&_k, &_zero64);
         _data_scale = *data_scale.lookup_or_init(&_k, &_zero64);
-        x[k] = (x[k] - out) * _data_scale;
+        x[k] = (x[k] - out) * _data_scale >> FXP_VALUE;
       }
 
       int rounded_value, tensor_int, tensor_frac, scale_factor_int, scale_factor_frac, accumulator, s_w_inv, s_x, s_x_inv, out_value;
@@ -433,6 +437,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
         _m = m;
         // s_w_inv = *((int*)layer_1_s_w_inv.lookup_or_init(&_m, &_zero));
         out_value = *layer_1_s_w_inv.lookup_or_init(&_m, &_zero);
+        out_value *= s_x_inv;
         // out_value = s_w_inv * s_x_inv;
         out = (int64_t)accumulator;
         if (out_value > (1 << FXP_VALUE)) {
@@ -567,9 +572,9 @@ if __name__ == '__main__':
                 for k, v in dropcnt.items():
                     print(v.value)
                     ret.append(int(v.value / (end - start1).total_seconds()))
-                duration = (end - start).total_seconds()
-                if duration > interval:
-                    break
+#                duration = (end - start).total_seconds()
+#                if duration > interval:
+#                    break
             except KeyboardInterrupt:
                 break
     finally:
