@@ -385,13 +385,57 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
       x[7] = pkt_leaf->features[1]/pkt_leaf->num_packets;
       x[8] = pkt_leaf->features[2]/pkt_leaf->num_packets;
 
-      pkt_leaf->features[3] += abs(x[3] - x[6]);
-      pkt_leaf->features[4] += abs(x[4] - x[7]);
-      pkt_leaf->features[5] += abs(x[5] - x[8]);
+      if (pkt_leaf->num_packets > 1) {
+        uint64_t n_prev = (uint64_t)(pkt_leaf->num_packets - 1);
+        #pragma unroll
+        for (int i = 0; i < 3; i++) {
+          uint64_t prev_sum = pkt_leaf->features[i] - (uint64_t)x[3 + i];
+          int64_t old_mean = (int64_t)(prev_sum / n_prev);
+          int64_t delta1 = x[3 + i] - old_mean;
+          int64_t delta2 = x[3 + i] - x[6 + i];
+          int64_t term;
+          if ((delta1 > -(1LL << 30)) && (delta1 < (1LL << 30)) &&
+              (delta2 > -(1LL << 30)) && (delta2 < (1LL << 30))) {
+            term = (delta1 * delta2) >> FXP_VALUE;
+          } else {
+            term = (delta1 >> (FXP_VALUE / 2)) * (delta2 >> (FXP_VALUE / 2));
+          }
+          if (term > 0) {
+            pkt_leaf->features[3 + i] += (u64)term;
+          }
 
-      x[9]  = pkt_leaf->features[3]/pkt_leaf->num_packets;
-      x[10] = pkt_leaf->features[4]/pkt_leaf->num_packets;
-      x[11] = pkt_leaf->features[5]/pkt_leaf->num_packets;
+          if (x[6 + i] > 0) {
+            uint64_t variance = pkt_leaf->features[3 + i] / n_prev;
+            int64_t mean_sq;
+            if (x[6 + i] < (1LL << 30)) {
+              mean_sq = (x[6 + i] * x[6 + i]) >> FXP_VALUE;
+            } else {
+              mean_sq = (x[6 + i] >> (FXP_VALUE / 2)) * (x[6 + i] >> (FXP_VALUE / 2));
+            }
+            uint64_t u_mean_sq = (uint64_t)mean_sq;
+            if (u_mean_sq > 0) {
+              if (variance < (1ULL << 46)) {
+                x[9 + i] = (int64_t)((variance << FXP_VALUE) / u_mean_sq);
+              } else {
+                uint64_t denom = u_mean_sq >> FXP_VALUE;
+                if (denom > 0) {
+                  x[9 + i] = (int64_t)(variance / denom);
+                } else {
+                  x[9 + i] = 0;
+                }
+              }
+            } else {
+              x[9 + i] = 0;
+            }
+          } else {
+            x[9 + i] = 0;
+          }
+        }
+      } else {
+        x[9]  = 0;
+        x[10] = 0;
+        x[11] = 0;
+      }
 
       unsigned int k, m, _k, _m;
 
