@@ -47,13 +47,74 @@ struct pkt_key_t {
   u32 dport;
 };
 
+struct welford_stat_t {
+  u64 sum;
+  u64 m2;
+};
+
 struct pkt_leaf_t {
   u32 num_packets;
   u64 last_packet_timestamp;
   u32 sport;
   u32 dport;
-  u64 features[6];
+  struct welford_stat_t stats[3];
 };
+
+enum flow_feature_idx {
+  FEAT_TOT_LEN   = 0,
+  FEAT_INTERVAL  = 1,
+  FEAT_DIRECTION = 2,
+  NUM_FLOW_FEATS = 3
+};
+
+#define IDX_RAW_OFFSET   3
+#define IDX_MEAN_OFFSET  6
+#define IDX_SQCV_OFFSET  9
+
+static __always_inline int64_t fxp_mul(int64_t a, int64_t b) {
+  if ((a > -(1LL << 30)) && (a < (1LL << 30)) &&
+      (b > -(1LL << 30)) && (b < (1LL << 30))) {
+    return (a * b) >> FXP_VALUE;
+  }
+  return (a >> (FXP_VALUE / 2)) * (b >> (FXP_VALUE / 2));
+}
+
+static __always_inline int64_t fxp_div_sqcv(uint64_t variance, uint64_t mean_sq) {
+  if (mean_sq == 0) return 0;
+  if (variance < (1ULL << 46)) {
+    return (int64_t)((variance << FXP_VALUE) / mean_sq);
+  }
+  uint64_t denom = mean_sq >> FXP_VALUE;
+  return (denom > 0) ? (int64_t)(variance / denom) : 0;
+}
+
+static __always_inline void update_welford_feature(struct welford_stat_t *stat,
+                                                   uint64_t num_packets,
+                                                   int64_t new_val,
+                                                   int64_t *out_mean,
+                                                   int64_t *out_sqcv) {
+  uint64_t n_prev = num_packets - 1;
+  int64_t old_mean = (int64_t)(stat->sum / n_prev);
+
+  stat->sum += (uint64_t)new_val;
+  int64_t new_mean = (int64_t)(stat->sum / num_packets);
+  *out_mean = new_mean;
+
+  int64_t delta1 = new_val - old_mean;
+  int64_t delta2 = new_val - new_mean;
+  int64_t term = fxp_mul(delta1, delta2);
+  if (term > 0) {
+    stat->m2 += (uint64_t)term;
+  }
+
+  if (new_mean > 0) {
+    uint64_t variance = stat->m2 / n_prev;
+    uint64_t mean_sq = (uint64_t)fxp_mul(new_mean, new_mean);
+    *out_sqcv = fxp_div_sqcv(variance, mean_sq);
+  } else {
+    *out_sqcv = 0;
+  }
+}
 
 BPF_PERCPU_ARRAY(out_input2, int64_t, 16);
 BPF_PERCPU_ARRAY(out_input, int64_t, 16);
@@ -244,7 +305,7 @@ int nn2(struct xdp_md *ctx) {
   }
   // mat_mult(x_q, w, output, dimension_layer);
   unsigned int argmax_over_cols = 0;
-  rounded_value = 0;
+  int64_t max_val = 0;
   for (m = 0; m < OUTPUT_DIM; m++) {
     accumulator = 0;
     for (k = 0; k < H2; k++) {
@@ -263,8 +324,8 @@ int nn2(struct xdp_md *ctx) {
     } else {
       out = (out_value*out + ROUND_CONST) >> FXP_VALUE;
     }
-    if (out > rounded_value) {
-      rounded_value = out;
+    if (m == 0 || out > max_val) {
+      max_val = out;
       argmax_over_cols = m; // return column
     }
   }
@@ -377,64 +438,23 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
       x[4] <<= FXP_VALUE;
       x[5] <<= FXP_VALUE;
 
-      pkt_leaf->features[0] += x[3];
-      pkt_leaf->features[1] += x[4];
-      pkt_leaf->features[2] += x[5];
-
-      x[6] = pkt_leaf->features[0]/pkt_leaf->num_packets;
-      x[7] = pkt_leaf->features[1]/pkt_leaf->num_packets;
-      x[8] = pkt_leaf->features[2]/pkt_leaf->num_packets;
-
       if (pkt_leaf->num_packets > 1) {
-        uint64_t n_prev = (uint64_t)(pkt_leaf->num_packets - 1);
         #pragma unroll
-        for (int i = 0; i < 3; i++) {
-          uint64_t prev_sum = pkt_leaf->features[i] - (uint64_t)x[3 + i];
-          int64_t old_mean = (int64_t)(prev_sum / n_prev);
-          int64_t delta1 = x[3 + i] - old_mean;
-          int64_t delta2 = x[3 + i] - x[6 + i];
-          int64_t term;
-          if ((delta1 > -(1LL << 30)) && (delta1 < (1LL << 30)) &&
-              (delta2 > -(1LL << 30)) && (delta2 < (1LL << 30))) {
-            term = (delta1 * delta2) >> FXP_VALUE;
-          } else {
-            term = (delta1 >> (FXP_VALUE / 2)) * (delta2 >> (FXP_VALUE / 2));
-          }
-          if (term > 0) {
-            pkt_leaf->features[3 + i] += (u64)term;
-          }
-
-          if (x[6 + i] > 0) {
-            uint64_t variance = pkt_leaf->features[3 + i] / n_prev;
-            int64_t mean_sq;
-            if (x[6 + i] < (1LL << 30)) {
-              mean_sq = (x[6 + i] * x[6 + i]) >> FXP_VALUE;
-            } else {
-              mean_sq = (x[6 + i] >> (FXP_VALUE / 2)) * (x[6 + i] >> (FXP_VALUE / 2));
-            }
-            uint64_t u_mean_sq = (uint64_t)mean_sq;
-            if (u_mean_sq > 0) {
-              if (variance < (1ULL << 46)) {
-                x[9 + i] = (int64_t)((variance << FXP_VALUE) / u_mean_sq);
-              } else {
-                uint64_t denom = u_mean_sq >> FXP_VALUE;
-                if (denom > 0) {
-                  x[9 + i] = (int64_t)(variance / denom);
-                } else {
-                  x[9 + i] = 0;
-                }
-              }
-            } else {
-              x[9 + i] = 0;
-            }
-          } else {
-            x[9 + i] = 0;
-          }
+        for (int i = 0; i < NUM_FLOW_FEATS; i++) {
+          update_welford_feature(&pkt_leaf->stats[i],
+                                 pkt_leaf->num_packets,
+                                 x[IDX_RAW_OFFSET + i],
+                                 &x[IDX_MEAN_OFFSET + i],
+                                 &x[IDX_SQCV_OFFSET + i]);
         }
       } else {
-        x[9]  = 0;
-        x[10] = 0;
-        x[11] = 0;
+        #pragma unroll
+        for (int i = 0; i < NUM_FLOW_FEATS; i++) {
+          pkt_leaf->stats[i].sum = (uint64_t)x[IDX_RAW_OFFSET + i];
+          pkt_leaf->stats[i].m2 = 0;
+          x[IDX_MEAN_OFFSET + i] = x[IDX_RAW_OFFSET + i];
+          x[IDX_SQCV_OFFSET + i] = 0;
+        }
       }
 
       unsigned int k, m, _k, _m;
