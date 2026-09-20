@@ -399,6 +399,7 @@ if __name__ == '__main__':
         prev = 0
         interval = 110
         start = datetime.now()
+        print("[CLASSIFIER_READY]", flush=True)
         while True:
             try:
                 dropcnt.clear()

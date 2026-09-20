@@ -56,20 +56,22 @@ def ensure_writable_results_dir(requested_path):
 DEFAULT_TEST_DURATION = 100               # Duration per test run in seconds (paper used 100)
 DEFAULT_COOLDOWN = 5                      # Cooldown in seconds between test runs
 
-# Map test sending intervals (microseconds) to target PPS and pktgen settings
-# Is = 0 us represents the paper's maximum rate limit (~800,000 pps)
+# Map test sending intervals (microseconds) to theoretical offered PPS and pktgen pacing.
+# Is is the inter-packet sending interval in microseconds.
+# Theoretical Offered PPS = 1,000,000 / Is (for Is >= 1).
+# Is = 0 us represents the paper's maximum flood limit (~800,000 pps).
 INTERVAL_CONFIGS = {
-    0:  {"ratep": 800000, "delay_ns": 0},      # ~800,000 pps (Flood limit in paper)
-    1:  {"ratep": 500000, "delay_ns": 1000},   # ~500,000 pps
-    2:  {"ratep": 333000, "delay_ns": 2000},   # ~333,000 pps
-    3:  {"ratep": 250000, "delay_ns": 3000},   # ~250,000 pps
-    4:  {"ratep": 200000, "delay_ns": 4000},   # ~200,000 pps
-    5:  {"ratep": 165000, "delay_ns": 5000},   # ~165,000 pps
-    6:  {"ratep": 140000, "delay_ns": 6000},   # ~140,000 pps
-    7:  {"ratep": 125000, "delay_ns": 7000},   # ~125,000 pps
-    8:  {"ratep": 110000, "delay_ns": 8000},   # ~110,000 pps
-    9:  {"ratep": 100000, "delay_ns": 9000},   # ~100,000 pps
-    10: {"ratep": 90000,  "delay_ns": 10000},  # ~90,000 pps
+    0:  {"expected_pps": 800000, "delay_ns": 0,     "ratep": 800000},  # ~800,000 pps (Flood limit in paper)
+    1:  {"expected_pps": 800000, "delay_ns": 1000,  "ratep": 0},       # Is = 1 us -> 1,000,000 pps (capped to ~800k in paper)
+    2:  {"expected_pps": 500000, "delay_ns": 2000,  "ratep": 0},       # Is = 2 us -> 500,000 pps
+    3:  {"expected_pps": 333333, "delay_ns": 3000,  "ratep": 0},       # Is = 3 us -> 333,333 pps
+    4:  {"expected_pps": 250000, "delay_ns": 4000,  "ratep": 0},       # Is = 4 us -> 250,000 pps
+    5:  {"expected_pps": 200000, "delay_ns": 5000,  "ratep": 0},       # Is = 5 us -> 200,000 pps (delay = 5,000 ns)
+    6:  {"expected_pps": 166667, "delay_ns": 6000,  "ratep": 0},       # Is = 6 us -> 166,667 pps
+    7:  {"expected_pps": 142857, "delay_ns": 7000,  "ratep": 0},       # Is = 7 us -> 142,857 pps
+    8:  {"expected_pps": 125000, "delay_ns": 8000,  "ratep": 0},       # Is = 8 us -> 125,000 pps
+    9:  {"expected_pps": 111111, "delay_ns": 9000,  "ratep": 0},       # Is = 9 us -> 111,111 pps
+    10: {"expected_pps": 100000, "delay_ns": 10000, "ratep": 0},       # Is = 10 us -> 100,000 pps
 }
 
 # ==============================================================================
@@ -132,6 +134,9 @@ def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us)
     echo 'count 0' > /proc/net/pktgen/{client_ifname}
     echo 'pkt_size 64' > /proc/net/pktgen/{client_ifname}
     echo 'clone_skb 256' > /proc/net/pktgen/{client_ifname}
+    
+    # Reset delay pacing register (rem_device/add_device above already resets ratep)
+    echo 'delay 0' > /proc/net/pktgen/{client_ifname} 2>/dev/null || true
     {rate_or_delay_cmd}
     
     echo 'dst {server_ip}' > /proc/net/pktgen/{client_ifname}
@@ -242,12 +247,7 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     # 2. Configure server hardware & queues
     configure_server_cores_and_queues(args.server, args.server_ifname, num_threads)
 
-    # 3. Start client pktgen traffic
-    print(f"[*] Starting client pktgen (Interval: {interval_us}us)...")
-    start_pktgen(args.client, args.client_ifname, args.server_ip, args.server_mac, interval_us)
-    time.sleep(2)
-
-    # 4. Start server classifier program with health check
+    # 3. Start server classifier program with handshake on [CLASSIFIER_READY]
     taskset_prefix = "taskset -c 0 " if num_threads == 1 else ""
     classifier_log = f"{remote_logdir}/classifier.log"
     pid_file = f"{remote_logdir}/classifier.pid"
@@ -257,16 +257,28 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     {taskset_prefix}python3 -u {app_path} {args.server_ifname} {remote_logdir} {flag} > {classifier_log} 2>&1 &
     PID=$!
     echo $PID > {pid_file}
-    sleep 2
-    if ! kill -0 $PID 2>/dev/null; then
-        exit 42
-    fi
     """
     print(f"[*] Starting server classifier: {app_name} {flag} (logging to {classifier_log})...")
-    check_res = subprocess.run(["ssh", args.server, start_classifier_script],
+    ssh_exec(args.server, start_classifier_script)
+
+    print("    [*] Waiting for classifier to compile eBPF and attach XDP hook...")
+    wait_ready_cmd = f"""
+    PID=$(cat {pid_file} 2>/dev/null || echo "")
+    for i in $(seq 1 30); do
+        if [ -n "$PID" ] && ! kill -0 $PID 2>/dev/null; then
+            exit 42
+        fi
+        if grep -q "\\[CLASSIFIER_READY\\]" {classifier_log} 2>/dev/null; then
+            exit 0
+        fi
+        sleep 0.5
+    done
+    exit 43
+    """
+    ready_res = subprocess.run(["ssh", args.server, wait_ready_cmd],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if check_res.returncode != 0:
-        print(f"\n[!] ERROR: Server classifier '{app_name}' failed to start or crashed on startup!")
+    if ready_res.returncode == 42:
+        print(f"\n[!] ERROR: Server classifier '{app_name}' crashed during startup/compilation!")
         err_log = ssh_exec(args.server, f"cat {classifier_log} 2>/dev/null || true", capture=True)
         print("-------------------- Classifier Error Log --------------------")
         print(err_log if err_log else "<No output captured in classifier.log>")
@@ -278,13 +290,21 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
             "ml_model": ml_model,
             "num_threads": num_threads,
             "interval_us": interval_us,
-            "target_ratep": INTERVAL_CONFIGS.get(interval_us, {}).get("ratep", 0),
+            "target_ratep": INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0),
             "mean_rxpps": 0.0,
             "std_rxpps": 0.0,
             "cpu_soft_pct": 0.0,
             "error": "Classifier startup failed"
         }
-    print(f"    [OK] Classifier is actively running on server.")
+    elif ready_res.returncode != 0:
+        print("    [!] Warning: Classifier startup timed out waiting for [CLASSIFIER_READY]. Continuing...")
+    else:
+        print("    [OK] Classifier attached to XDP and actively running.")
+
+    # 4. Start client pktgen traffic
+    print(f"[*] Starting client pktgen (Interval: {interval_us}us)...")
+    start_pktgen(args.client, args.client_ifname, args.server_ip, args.server_mac, interval_us)
+    time.sleep(1)
 
     # 5. Measure CPU utilization with mpstat on server for TEST_DURATION seconds
     print(f"[*] Monitoring execution for {args.duration} seconds via mpstat...")
@@ -369,7 +389,7 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
         "ml_model": ml_model,
         "num_threads": num_threads,
         "interval_us": interval_us,
-        "target_ratep": INTERVAL_CONFIGS.get(interval_us, {}).get("ratep", 0),
+        "target_ratep": INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0),
         "mean_rxpps": mean_rx,
         "std_rxpps": std_rx,
         "cpu_soft_pct": cpu_soft
@@ -413,9 +433,9 @@ def main():
     args.local_results_dir = ensure_writable_results_dir(args.local_results_dir)
 
     if args.quick:
-        args.duration = 5
+        args.duration = 7
         args.intervals = [0, 5]
-        print("[!] QUICK SMOKE TEST MODE ACTIVATED (5s per test, limited intervals)")
+        print("[!] QUICK SMOKE TEST MODE ACTIVATED (7s per test, limited intervals)")
 
     # Pre-flight check: ensure SSH connections work and check dependencies
     print("[*] Pre-flight check: Testing SSH connections & remote environment...")
