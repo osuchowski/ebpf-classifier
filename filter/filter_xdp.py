@@ -121,7 +121,7 @@ int xdp_drop_packet(struct xdp_md *ctx) {
       zero.daddr = pkt_key.daddr;
       zero.num_packets = 0;
       zero.last_packet_timestamp = ts;
-      sessions.lookup_or_try_init(&pkt_key, &zero);
+      sessions.update(&pkt_key, &zero);
       pkt_leaf = sessions.lookup(&pkt_key);
     }
     if (pkt_leaf != NULL) {
@@ -190,25 +190,32 @@ def map_bpf_table(hashmap, values):
 
 if __name__ == '__main__':
 
-    if len(sys.argv) < 3 or len(sys.argv) > 4:
+    if len(sys.argv) < 2 or len(sys.argv) > 4:
         usage()
     device = sys.argv[1]
-    resdir = sys.argv[2]
+    resdir = "."
     flags = 0
     offload_device = None
     ret = []
-    if len(sys.argv) == 3:
-        if "-S" in sys.argv:
-            # XDP_FLAGS_SKB_MODE
-            flags |= BPF.XDP_FLAGS_SKB_MODE
-        if "-D" in sys.argv:
-            # XDP_FLAGS_DRV_MODE
-            flags |= BPF.XDP_FLAGS_DRV_MODE
-        if "-H" in sys.argv:
-            # XDP_FLAGS_HW_MODE
-            offload_device = device
-            flags |= BPF.XDP_FLAGS_HW_MODE
-    b = BPF(text=bpf_text)
+
+    if "-S" in sys.argv:
+        # XDP_FLAGS_SKB_MODE
+        flags |= BPF.XDP_FLAGS_SKB_MODE
+    if "-D" in sys.argv:
+        # XDP_FLAGS_DRV_MODE
+        flags |= BPF.XDP_FLAGS_DRV_MODE
+    if "-H" in sys.argv:
+        # XDP_FLAGS_HW_MODE
+        offload_device = device
+        flags |= BPF.XDP_FLAGS_HW_MODE
+
+    # If logdir is provided
+    if len(sys.argv) >= 3 and not sys.argv[2].startswith("-"):
+        resdir = sys.argv[2]
+    elif len(sys.argv) == 4 and not sys.argv[3].startswith("-"):
+        resdir = sys.argv[3]
+
+    b = BPF(text=bpf_text, cflags=["-w", "-Wno-microsoft-anon-tag", "-fms-extensions"])
     # b = BPF(text=bpf_text, device=offload_device)
     # for i in range(0, lib.bpf_num_functions(b.module)):
     #     func_name = lib.bpf_function_name(b.module, i)
@@ -225,6 +232,7 @@ if __name__ == '__main__':
         prev = 0
         interval = 100
         start = datetime.now()
+        print("[CLASSIFIER_READY]", flush=True)
         while True:
             try:
                 dropcnt.clear()
@@ -232,23 +240,26 @@ if __name__ == '__main__':
                 time.sleep(1)
                 end = datetime.now()
                 for k, v in dropcnt.items():
-                    # print(v.value)
-                    ret.append(int(v.value / (end - start1).total_seconds()))
+                    rate = int(v.value / (end - start1).total_seconds())
+                    print(f"{end} {rate}", flush=True)
+                    ret.append(rate)
                 duration = (end - start).total_seconds()
                 if duration > interval:
                     break
             except KeyboardInterrupt:
                 break
     finally:
-        b.remove_xdp(device, flags)
-        filename = f"{resdir}/rxpps.log"
-        if "-S" in sys.argv:
-            # XDP_FLAGS_SKB_MODE
+        try:
+            os.makedirs(resdir, exist_ok=True)
             filename = f"{resdir}/rxpps.log"
-        if "-D" in sys.argv:
-            filename = f"{resdir}/rxpps.log"
-        with open (filename, 'w') as f:
-            for d in ret:
-                f.write(f"{d}\n")
+            with open(filename, 'w') as f:
+                for d in ret:
+                    f.write(f"{d}\n")
+        except Exception as e:
+            print(f"Error writing {resdir}/rxpps.log: {e}", file=sys.stderr)
+        try:
+            b.remove_xdp(device, flags)
+        except Exception as e:
+            print(f"Error removing XDP: {e}", file=sys.stderr)
         # b.remove_xdp('router-veth2', flags)
 

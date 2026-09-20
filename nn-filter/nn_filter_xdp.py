@@ -11,7 +11,10 @@ import json
 from socket import inet_ntop, ntohs, AF_INET, AF_INET6
 from struct import pack
 import ctypes as ct
-import joblib
+try:
+    import joblib
+except ImportError:
+    joblib = None
 from datetime import datetime
 
 curdir = os.path.dirname(__file__)
@@ -263,7 +266,7 @@ int nn2(struct xdp_md *ctx) {
     } else {
       out = (out_value*out + ROUND_CONST) >> FXP_VALUE;
     }
-    if (out > rounded_value) {
+    if (m == 0 || out > rounded_value) {
       rounded_value = out;
       argmax_over_cols = m; // return column
     }
@@ -485,25 +488,32 @@ def map_bpf_table(hashmap, values, c_type='int'):
     hashmap.items_update_batch(keys, new_values)
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3 or len(sys.argv) > 4:
+    if len(sys.argv) < 2 or len(sys.argv) > 4:
         usage()
     device = sys.argv[1]
-    resdir = sys.argv[2]
+    resdir = "."
     maptype = "percpu_array"
     flags = 0
     offload_device = None
-    if len(sys.argv) == 4:
-        if "-S" in sys.argv:
-            # XDP_FLAGS_SKB_MODE
-            flags |= BPF.XDP_FLAGS_SKB_MODE
-        if "-D" in sys.argv:
-            # XDP_FLAGS_DRV_MODE
-            flags |= BPF.XDP_FLAGS_DRV_MODE
-        if "-H" in sys.argv:
-            # XDP_FLAGS_HW_MODE
-            maptype = "array"
-            offload_device = device.encode()
-            flags |= BPF.XDP_FLAGS_HW_MODE
+
+    if "-S" in sys.argv:
+        # XDP_FLAGS_SKB_MODE
+        flags |= BPF.XDP_FLAGS_SKB_MODE
+    if "-D" in sys.argv:
+        # XDP_FLAGS_DRV_MODE
+        flags |= BPF.XDP_FLAGS_DRV_MODE
+    if "-H" in sys.argv:
+        # XDP_FLAGS_HW_MODE
+        maptype = "array"
+        offload_device = device.encode()
+        flags |= BPF.XDP_FLAGS_HW_MODE
+
+    # If logdir is provided
+    if len(sys.argv) >= 3 and not sys.argv[2].startswith("-"):
+        resdir = sys.argv[2]
+    elif len(sys.argv) == 4 and not sys.argv[3].startswith("-"):
+        resdir = sys.argv[3]
+
     prefix_path = "runs"
     with open(f"{curdir}/mlp_params.json") as f:
         params = json.load(f)
@@ -521,7 +531,7 @@ if __name__ == '__main__':
 
     ret = []
     # b = BPF(text=bpf_text, debug=0,  cflags=["-w", "-DMAPTYPE={maptype}"],
-    b = BPF(text=bpf_text, debug=0,  cflags=["-w"],
+    b = BPF(text=bpf_text, debug=0, cflags=["-w", "-Wno-microsoft-anon-tag", "-fms-extensions"],
             # allow_rlimit=True,
             device=offload_device)
     # for i in range(0, lib.bpf_num_functions(b.module)):
@@ -572,6 +582,7 @@ if __name__ == '__main__':
         prev = 0
         interval = 100
         start = datetime.now()
+        print("[CLASSIFIER_READY]", flush=True)
         while True:
             try:
                 dropcnt.clear()
@@ -579,11 +590,25 @@ if __name__ == '__main__':
                 time.sleep(1)
                 end = datetime.now()
                 for k, v in dropcnt.items():
-                    print(end, int(v.value / (end - start1).total_seconds()))
-                    ret.append(int(v.value / (end - start1).total_seconds()))
+                    rate = int(v.value / (end - start1).total_seconds())
+                    print(f"{end} {rate}", flush=True)
+                    ret.append(rate)
                 duration = (end - start).total_seconds()
+                if duration > interval:
+                    break
             except KeyboardInterrupt:
                 break
     finally:
-        b.remove_xdp(device, flags)
+        try:
+            os.makedirs(resdir, exist_ok=True)
+            filename = f"{resdir}/rxpps.log"
+            with open(filename, 'w') as f:
+                for d in ret:
+                    f.write(f"{d}\n")
+        except Exception as e:
+            print(f"Error writing {resdir}/rxpps.log: {e}", file=sys.stderr)
+        try:
+            b.remove_xdp(device, flags)
+        except Exception as e:
+            print(f"Error removing XDP: {e}", file=sys.stderr)
 
