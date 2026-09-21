@@ -62,7 +62,7 @@ DEFAULT_COOLDOWN = 5                      # Cooldown in seconds between test run
 # Is = 0 us represents the paper's maximum flood limit (~800,000 pps).
 INTERVAL_CONFIGS = {
     0:  {"expected_pps": 800000, "delay_ns": 0,     "ratep": 800000},  # ~800,000 pps (Flood limit in paper)
-    1:  {"expected_pps": 800000, "delay_ns": 1000,  "ratep": 0},       # Is = 1 us -> 1,000,000 pps (capped to ~800k in paper)
+    1:  {"expected_pps": 800000, "delay_ns": 0,     "ratep": 800000},  # Is = 1 us -> capped to ~800k in paper
     2:  {"expected_pps": 500000, "delay_ns": 2000,  "ratep": 0},       # Is = 2 us -> 500,000 pps
     3:  {"expected_pps": 333333, "delay_ns": 3000,  "ratep": 0},       # Is = 3 us -> 333,333 pps
     4:  {"expected_pps": 250000, "delay_ns": 4000,  "ratep": 0},       # Is = 4 us -> 250,000 pps
@@ -115,10 +115,10 @@ def stop_pktgen(client_host):
 def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us):
     """Starts pktgen with the exact 1-flow UDP 10000:10000 configuration from Hara & Sasabe."""
     cfg = INTERVAL_CONFIGS.get(interval_us, {"ratep": 800000, "delay_ns": 0})
-    if cfg['delay_ns'] > 0:
-        rate_or_delay_cmd = f"echo 'delay {cfg['delay_ns']}' > /proc/net/pktgen/{client_ifname};"
-    elif cfg['ratep'] > 0:
+    if cfg.get('ratep', 0) > 0:
         rate_or_delay_cmd = f"echo 'ratep {cfg['ratep']}' > /proc/net/pktgen/{client_ifname};"
+    elif cfg.get('delay_ns', 0) > 0:
+        rate_or_delay_cmd = f"echo 'delay {cfg['delay_ns']}' > /proc/net/pktgen/{client_ifname};"
     else:
         rate_or_delay_cmd = f"echo 'delay 0' > /proc/net/pktgen/{client_ifname};"
 
