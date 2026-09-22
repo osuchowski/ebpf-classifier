@@ -112,8 +112,8 @@ def stop_pktgen(client_host):
     )
     ssh_exec(client_host, script, check=False)
 
-def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us):
-    """Starts pktgen with the exact 1-flow UDP 10000:10000 configuration from Hara & Sasabe."""
+def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us, num_threads=1):
+    """Starts pktgen with UDP traffic configured for single-flow (1 thread) or 32-flow RSS entropy (>1 threads)."""
     cfg = INTERVAL_CONFIGS.get(interval_us, {"ratep": 800000, "delay_ns": 0})
     if cfg.get('ratep', 0) > 0:
         rate_or_delay_cmd = f"echo 'ratep {cfg['ratep']}' > /proc/net/pktgen/{client_ifname};"
@@ -121,6 +121,17 @@ def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us)
         rate_or_delay_cmd = f"echo 'delay {cfg['delay_ns']}' > /proc/net/pktgen/{client_ifname};"
     else:
         rate_or_delay_cmd = f"echo 'delay 0' > /proc/net/pktgen/{client_ifname};"
+
+    # Multi-threading flow distribution:
+    # When num_threads > 1, generate a 32-flow pool (udp_src 10000..10031) so NIC RSS hashes
+    # packets evenly across all RX queues. 32 flows comfortably fit within the 1024-entry BPF sessions table.
+    # When num_threads == 1, maintain strict single-flow baseline (10000 -> 10000).
+    if num_threads > 1:
+        udp_src_min = 10000
+        udp_src_max = 10031
+    else:
+        udp_src_min = 10000
+        udp_src_max = 10000
 
     # Note: echo 'start' > /proc/net/pktgen/pgctrl blocks until stopped in the kernel,
     # so it MUST be backgrounded with nohup so the SSH session returns immediately.
@@ -142,9 +153,9 @@ def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us)
     echo 'dst {server_ip}' > /proc/net/pktgen/{client_ifname}
     echo 'dst_mac {server_mac}' > /proc/net/pktgen/{client_ifname}
     
-    # Exact Hara & Sasabe flow tuple (fixed ports 10000 -> 10000)
-    echo 'udp_src_min 10000' > /proc/net/pktgen/{client_ifname}
-    echo 'udp_src_max 10000' > /proc/net/pktgen/{client_ifname}
+    # UDP flow ports
+    echo 'udp_src_min {udp_src_min}' > /proc/net/pktgen/{client_ifname}
+    echo 'udp_src_max {udp_src_max}' > /proc/net/pktgen/{client_ifname}
     echo 'udp_dst_min 10000' > /proc/net/pktgen/{client_ifname}
     echo 'udp_dst_max 10000' > /proc/net/pktgen/{client_ifname}
     
@@ -170,16 +181,46 @@ def cleanup_server(server_host, server_ifname):
 def configure_server_cores_and_queues(server_host, server_ifname, num_threads):
     """Sets CPU isolation and NIC queue counts matching the thread configuration."""
     script = f"""
-    # Configure combined queues
+    # 1. Dynamic CPU online/offline matching num_threads MUST run FIRST before ethtool.
+    # Otherwise ethtool -L combined <num_threads> will fail or fall back because requested
+    # queue vectors cannot be bound to offline CPUs.
+    max_cpu=$(($(nproc --all 2>/dev/null || echo 4) - 1))
+    if [ {num_threads} -eq 1 ]; then
+        chcpu -e 0 >/dev/null 2>&1 || true
+    else
+        chcpu -e 0-$(({num_threads} - 1)) >/dev/null 2>&1 || true
+    fi
+    if [ {num_threads} -le $max_cpu ]; then
+        if [ {num_threads} -eq $max_cpu ]; then
+            chcpu -d {num_threads} >/dev/null 2>&1 || true
+        else
+            chcpu -d {num_threads}-$max_cpu >/dev/null 2>&1 || true
+        fi
+    fi
+    sleep 0.5
+
+    # 2. Configure combined queues now that all required CPUs are online
     ethtool -L {server_ifname} combined {num_threads} 2>/dev/null || true
     ethtool -G {server_ifname} rx 4096 tx 4096 2>/dev/null || true
     ethtool -C {server_ifname} adaptive-rx off rx-usecs 0 2>/dev/null || true
-    
-    # Pin IRQ for queue 0 to CPU 0
+    sleep 0.5
+
+    # 3. Pin IRQs 1-to-1 to active CPUs (Queue 0 -> CPU 0, Queue 1 -> CPU 1, etc.)
     systemctl stop irqbalance 2>/dev/null || true
+    q=0
     for irq in $(grep {server_ifname} /proc/interrupts | awk '{{print $1}}' | tr -d ':'); do
-        echo '0' > /proc/irq/$irq/smp_affinity_list 2>/dev/null || true
+        target_cpu=$((q % {num_threads}))
+        echo $target_cpu > /proc/irq/$irq/smp_affinity_list 2>/dev/null || true
+        q=$((q + 1))
     done
+    """
+    ssh_exec(server_host, script, check=False)
+
+def restore_server_cores(server_host):
+    """Re-enables all CPU cores on the server upon test suite completion."""
+    script = """
+    max_cpu=$(($(nproc --all 2>/dev/null || echo 4) - 1))
+    chcpu -e 0-$max_cpu 2>/dev/null || true
     """
     ssh_exec(server_host, script, check=False)
 
@@ -302,8 +343,8 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
         print("    [OK] Classifier attached to XDP and actively running.")
 
     # 4. Start client pktgen traffic
-    print(f"[*] Starting client pktgen (Interval: {interval_us}us)...")
-    start_pktgen(args.client, args.client_ifname, args.server_ip, args.server_mac, interval_us)
+    print(f"[*] Starting client pktgen (Interval: {interval_us}us, Threads: {num_threads})...")
+    start_pktgen(args.client, args.client_ifname, args.server_ip, args.server_mac, interval_us, num_threads=num_threads)
     time.sleep(1)
 
     # 5. Measure CPU utilization with mpstat on server for TEST_DURATION seconds
@@ -368,6 +409,7 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
 
     # Parse CPU softirq usage from mpstat.json
     cpu_soft = 0.0
+    per_core_info = ""
     mpstat_file = local_trial_dir / "mpstat.json"
     if mpstat_file.exists():
         try:
@@ -378,10 +420,21 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
                 soft_vals = [entry.get("cpu-load", [{}])[0].get("soft", 0.0) for entry in stats if entry.get("cpu-load")]
                 if soft_vals:
                     cpu_soft = sum(soft_vals) / len(soft_vals)
+
+                # Per-core softirq breakdown for multi-core verification
+                per_core_soft = {}
+                for entry in stats:
+                    for c_load in entry.get("cpu-load", [])[1:]:
+                        c_id = c_load.get("cpu")
+                        if c_id not in per_core_soft:
+                            per_core_soft[c_id] = []
+                        per_core_soft[c_id].append(c_load.get("soft", 0.0))
+                if per_core_soft:
+                    per_core_info = " (" + ", ".join(f"CPU{k}: {sum(v)/len(v):.1f}%" for k, v in sorted(per_core_soft.items())) + ")"
         except Exception as e:
             pass
 
-    print(f"[+] Result: RX Throughput: {mean_rx:,.0f} pps (std: {std_rx:,.0f}) | CPU SoftIRQ: {cpu_soft:.1f}%")
+    print(f"[+] Result: RX Throughput: {mean_rx:,.0f} pps (std: {std_rx:,.0f}) | CPU SoftIRQ: {cpu_soft:.1f}%{per_core_info}")
     time.sleep(args.cooldown)
 
     return {
@@ -469,6 +522,9 @@ def main():
     if args.sync:
         sync_code_to_server(args)
 
+    # Ensure all server cores are online before starting the test matrix
+    restore_server_cores(args.server)
+
     all_results = []
     total_tests = len(args.threads) * len(args.modes) * len(args.models) * len(args.intervals)
     current_test = 0
@@ -489,6 +545,7 @@ def main():
     finally:
         stop_pktgen(args.client)
         cleanup_server(args.server, args.server_ifname)
+        restore_server_cores(args.server)
 
     # Save summary CSV
     csv_file = Path(args.local_results_dir) / "summary_stage2.csv"
