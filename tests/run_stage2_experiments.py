@@ -58,20 +58,20 @@ DEFAULT_COOLDOWN = 5                      # Cooldown in seconds between test run
 
 # Map test sending intervals (microseconds) to theoretical offered PPS and pktgen pacing.
 # Is is the inter-packet sending interval in microseconds.
-# Theoretical Offered PPS = 1,000,000 / Is (for Is >= 1).
-# Is = 0 us represents the paper's maximum flood limit (~800,000 pps).
+# Is = 0 us represents unconstrained wire-speed flood (10GbE 64B line rate: 14.88 Mpps).
+# For Is >= 1, Theoretical Offered PPS = 1,000,000 / Is.
 INTERVAL_CONFIGS = {
-    0:  {"expected_pps": 800000, "delay_ns": 0,     "ratep": 800000},  # ~800,000 pps (Flood limit in paper)
-    1:  {"expected_pps": 800000, "delay_ns": 0,     "ratep": 800000},  # Is = 1 us -> capped to ~800k in paper
-    2:  {"expected_pps": 500000, "delay_ns": 2000,  "ratep": 0},       # Is = 2 us -> 500,000 pps
-    3:  {"expected_pps": 333333, "delay_ns": 3000,  "ratep": 0},       # Is = 3 us -> 333,333 pps
-    4:  {"expected_pps": 250000, "delay_ns": 4000,  "ratep": 0},       # Is = 4 us -> 250,000 pps
-    5:  {"expected_pps": 200000, "delay_ns": 5000,  "ratep": 0},       # Is = 5 us -> 200,000 pps (delay = 5,000 ns)
-    6:  {"expected_pps": 166667, "delay_ns": 6000,  "ratep": 0},       # Is = 6 us -> 166,667 pps
-    7:  {"expected_pps": 142857, "delay_ns": 7000,  "ratep": 0},       # Is = 7 us -> 142,857 pps
-    8:  {"expected_pps": 125000, "delay_ns": 8000,  "ratep": 0},       # Is = 8 us -> 125,000 pps
-    9:  {"expected_pps": 111111, "delay_ns": 9000,  "ratep": 0},       # Is = 9 us -> 111,111 pps
-    10: {"expected_pps": 100000, "delay_ns": 10000, "ratep": 0},       # Is = 10 us -> 100,000 pps
+    0:  {"expected_pps": 14880952, "delay_ns": 0,     "ratep": 0},  # Is = 0 us: unconstrained 10GbE wire flood (14.88 Mpps)
+    1:  {"expected_pps": 1000000,  "delay_ns": 1000,  "ratep": 0},  # Is = 1 us -> 1,000,000 pps (1 Mpps)
+    2:  {"expected_pps": 500000,   "delay_ns": 2000,  "ratep": 0},  # Is = 2 us -> 500,000 pps
+    3:  {"expected_pps": 333333,   "delay_ns": 3000,  "ratep": 0},  # Is = 3 us -> 333,333 pps
+    4:  {"expected_pps": 250000,   "delay_ns": 4000,  "ratep": 0},  # Is = 4 us -> 250,000 pps
+    5:  {"expected_pps": 200000,   "delay_ns": 5000,  "ratep": 0},  # Is = 5 us -> 200,000 pps
+    6:  {"expected_pps": 166667,   "delay_ns": 6000,  "ratep": 0},  # Is = 6 us -> 166,667 pps
+    7:  {"expected_pps": 142857,   "delay_ns": 7000,  "ratep": 0},  # Is = 7 us -> 142,857 pps
+    8:  {"expected_pps": 125000,   "delay_ns": 8000,  "ratep": 0},  # Is = 8 us -> 125,000 pps
+    9:  {"expected_pps": 111111,   "delay_ns": 9000,  "ratep": 0},  # Is = 9 us -> 111,111 pps
+    10: {"expected_pps": 100000,   "delay_ns": 10000, "ratep": 0},  # Is = 10 us -> 100,000 pps
 }
 
 # ==============================================================================
@@ -100,65 +100,136 @@ def ssh_popen(host, command):
 # ==============================================================================
 # CLIENT (PKTGEN) CONTROL
 # ==============================================================================
+def get_remote_numa_cpus(host, ifname, count=1):
+    """Discovers the NUMA node for a given network interface on host,
+    and returns a list of CPU IDs belonging to that NUMA node/socket.
+    Prefers physical cores over sibling hyperthreads when possible."""
+    script = f"""
+    node=$(cat /sys/class/net/{ifname}/device/numa_node 2>/dev/null || echo 0)
+    if [ -z "$node" ] || [ "$node" -lt 0 ] 2>/dev/null; then node=0; fi
+    cat /sys/devices/system/node/node${{node}}/cpulist 2>/dev/null || echo "0"
+    """
+    res = ssh_exec(host, script, capture=True)
+    cpus = []
+    if res:
+        for part in res.strip().split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    start, end = map(int, part.split("-"))
+                    cpus.extend(range(start, end + 1))
+                except ValueError:
+                    pass
+            elif part.isdigit():
+                cpus.append(int(part))
+    if not cpus:
+        cpus = list(range(max(count, 1)))
+
+    if count <= len(cpus):
+        return cpus[:count]
+    return cpus
+
 def stop_pktgen(client_host):
-    """Stops and clears any active pktgen worker on Client."""
+    """Stops and clears all active pktgen workers across all CPUs on Client."""
     script = (
         "if [ -f /proc/net/pktgen/pgctrl ]; then "
         "  echo 'stop' > /proc/net/pktgen/pgctrl 2>/dev/null || true; "
         "  sleep 0.5; "
-        "  echo 'rem_device_all' > /proc/net/pktgen/kpktgend_0 2>/dev/null || true; "
+        "  echo 'reset' > /proc/net/pktgen/pgctrl 2>/dev/null || true; "
+        "  for th in /proc/net/pktgen/kpktgend_*; do "
+        "    [ -f \"$th\" ] && echo 'rem_device_all' > \"$th\" 2>/dev/null || true; "
+        "  done; "
         "fi; "
         "killall -9 hping3 2>/dev/null || true"
     )
     ssh_exec(client_host, script, check=False)
 
-def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us, num_threads=1):
-    """Starts pktgen with UDP traffic configured for single-flow (1 thread) or 32-flow RSS entropy (>1 threads)."""
-    cfg = INTERVAL_CONFIGS.get(interval_us, {"ratep": 800000, "delay_ns": 0})
-    if cfg.get('ratep', 0) > 0:
-        rate_or_delay_cmd = f"echo 'ratep {cfg['ratep']}' > /proc/net/pktgen/{client_ifname};"
-    elif cfg.get('delay_ns', 0) > 0:
-        rate_or_delay_cmd = f"echo 'delay {cfg['delay_ns']}' > /proc/net/pktgen/{client_ifname};"
-    else:
-        rate_or_delay_cmd = f"echo 'delay 0' > /proc/net/pktgen/{client_ifname};"
+def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us, num_threads=1, rate_limit=0):
+    """Starts pktgen with UDP traffic bound to the NUMA node of the client interface.
+    Supports single-flow baseline (num_threads=1) or multi-queue RSS entropy (num_threads > 1)."""
+    cfg = INTERVAL_CONFIGS.get(interval_us, {"ratep": 0, "delay_ns": 0, "expected_pps": 14880952})
+    delay_ns = cfg.get("delay_ns", 0)
+    ratep = rate_limit if rate_limit > 0 else cfg.get("ratep", 0)
 
-    # Multi-threading flow distribution:
-    # When num_threads > 1, generate a 32-flow pool (udp_src 10000..10031) so NIC RSS hashes
-    # packets evenly across all RX queues. 32 flows comfortably fit within the 1024-entry BPF sessions table.
-    # When num_threads == 1, maintain strict single-flow baseline (10000 -> 10000).
-    if num_threads > 1:
-        udp_src_min = 10000
-        udp_src_max = 10031
-    else:
-        udp_src_min = 10000
-        udp_src_max = 10000
+    # Discover CPUs on the socket/NUMA node owning client_ifname
+    target_cpus = get_remote_numa_cpus(client_host, client_ifname, count=num_threads)
+    actual_threads = len(target_cpus)
+    print(f"    [*] Client NUMA binding: {actual_threads} worker(s) pinned to Socket CPUs: {target_cpus}")
 
-    # Note: echo 'start' > /proc/net/pktgen/pgctrl blocks until stopped in the kernel,
-    # so it MUST be backgrounded with nohup so the SSH session returns immediately.
+    # Determine per-thread pacing rate if ratep is set
+    ratep_per_thread = max(1, ratep // actual_threads) if ratep > 0 else 0
+
+    thread_setup_cmds = []
+    for q_idx, cpu in enumerate(target_cpus):
+        dev_alias = f"{client_ifname}@{q_idx}" if actual_threads > 1 else client_ifname
+
+        # Pacing and burst settings:
+        # In flood mode (interval_us == 0):
+        # - Use burst 32 (skb->xmit_more batching) with clone_skb 0 for maximum line rate.
+        # When delay pacing is requested (interval_us > 0):
+        # - Use burst 0 and clone_skb 0 so each packet respects the inter-packet gap.
+        if interval_us == 0:
+            burst_cmd = f"echo 'burst 32' > /proc/net/pktgen/{dev_alias}"
+            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
+            pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
+        elif ratep_per_thread > 0:
+            burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
+            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
+            pacing_cmd = f"echo 'ratep {ratep_per_thread}' > /proc/net/pktgen/{dev_alias}"
+        elif delay_ns > 0:
+            burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
+            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
+            pacing_cmd = f"echo 'delay {delay_ns}' > /proc/net/pktgen/{dev_alias}"
+        else:
+            burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
+            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
+            pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
+
+        # Multi-queue TX mapping and UDP flow entropy
+        if actual_threads > 1:
+            q_map_cmd = f"""
+            echo 'queue_map_min {q_idx}' > /proc/net/pktgen/{dev_alias}
+            echo 'queue_map_max {q_idx}' > /proc/net/pktgen/{dev_alias}
+            """
+            udp_src_min = 10000 + q_idx * 100
+            udp_src_max = 10099 + q_idx * 100
+        else:
+            q_map_cmd = ""
+            udp_src_min = 10000
+            udp_src_max = 10000
+
+        thread_setup_cmds.append(f"""
+        echo 'rem_device_all' > /proc/net/pktgen/kpktgend_{cpu} 2>/dev/null || true
+        echo 'add_device {dev_alias}' > /proc/net/pktgen/kpktgend_{cpu}
+        echo 'count 0' > /proc/net/pktgen/{dev_alias}
+        echo 'pkt_size 64' > /proc/net/pktgen/{dev_alias}
+        {burst_cmd}
+        {clone_cmd}
+        {pacing_cmd}
+        {q_map_cmd}
+        echo 'dst {server_ip}' > /proc/net/pktgen/{dev_alias}
+        echo 'dst_mac {server_mac}' > /proc/net/pktgen/{dev_alias}
+        echo 'udp_src_min {udp_src_min}' > /proc/net/pktgen/{dev_alias}
+        echo 'udp_src_max {udp_src_max}' > /proc/net/pktgen/{dev_alias}
+        echo 'udp_dst_min 10000' > /proc/net/pktgen/{dev_alias}
+        echo 'udp_dst_max 10000' > /proc/net/pktgen/{dev_alias}
+        """)
+
+    all_threads_script = "\n".join(thread_setup_cmds)
+
     script = f"""
     modprobe pktgen 2>/dev/null || true
     echo 'stop' > /proc/net/pktgen/pgctrl 2>/dev/null || true
     sleep 0.2
-    echo 'rem_device_all' > /proc/net/pktgen/kpktgend_0 2>/dev/null || true
-    echo 'add_device {client_ifname}' > /proc/net/pktgen/kpktgend_0
-    
-    echo 'count 0' > /proc/net/pktgen/{client_ifname}
-    echo 'pkt_size 64' > /proc/net/pktgen/{client_ifname}
-    echo 'clone_skb 256' > /proc/net/pktgen/{client_ifname}
-    
-    # Reset delay pacing register (rem_device/add_device above already resets ratep)
-    echo 'delay 0' > /proc/net/pktgen/{client_ifname} 2>/dev/null || true
-    {rate_or_delay_cmd}
-    
-    echo 'dst {server_ip}' > /proc/net/pktgen/{client_ifname}
-    echo 'dst_mac {server_mac}' > /proc/net/pktgen/{client_ifname}
-    
-    # UDP flow ports
-    echo 'udp_src_min {udp_src_min}' > /proc/net/pktgen/{client_ifname}
-    echo 'udp_src_max {udp_src_max}' > /proc/net/pktgen/{client_ifname}
-    echo 'udp_dst_min 10000' > /proc/net/pktgen/{client_ifname}
-    echo 'udp_dst_max 10000' > /proc/net/pktgen/{client_ifname}
-    
+    echo 'reset' > /proc/net/pktgen/pgctrl 2>/dev/null || true
+
+    # Configure client NIC combined queues & rings to match worker count
+    ethtool -L {client_ifname} combined {actual_threads} 2>/dev/null || true
+    ethtool -G {client_ifname} tx 4096 2>/dev/null || true
+    ethtool -C {client_ifname} adaptive-tx off tx-usecs 0 2>/dev/null || true
+
+    {all_threads_script}
+
     nohup bash -c "echo 'start' > /proc/net/pktgen/pgctrl" </dev/null >/dev/null 2>&1 &
     """
     ssh_exec(client_host, script)
@@ -178,26 +249,38 @@ def cleanup_server(server_host, server_ifname):
     """
     ssh_exec(server_host, script, check=False)
 
-def configure_server_cores_and_queues(server_host, server_ifname, num_threads):
+def configure_server_cores_and_queues(server_host, server_ifname, num_threads, offline_cpus=False):
     """Sets CPU isolation and NIC queue counts matching the thread configuration."""
-    script = f"""
-    # 1. Dynamic CPU online/offline matching num_threads MUST run FIRST before ethtool.
-    # Otherwise ethtool -L combined <num_threads> will fail or fall back because requested
-    # queue vectors cannot be bound to offline CPUs.
-    max_cpu=$(($(nproc --all 2>/dev/null || echo 4) - 1))
-    if [ {num_threads} -eq 1 ]; then
-        chcpu -e 0 >/dev/null 2>&1 || true
-    else
-        chcpu -e 0-$(({num_threads} - 1)) >/dev/null 2>&1 || true
-    fi
-    if [ {num_threads} -le $max_cpu ]; then
-        if [ {num_threads} -eq $max_cpu ]; then
-            chcpu -d {num_threads} >/dev/null 2>&1 || true
+    chcpu_cmd = ""
+    if offline_cpus:
+        chcpu_cmd = f"""
+        max_cpu=$(($(nproc --all 2>/dev/null || echo 4) - 1))
+        if [ {num_threads} -eq 1 ]; then
+            chcpu -e 0 >/dev/null 2>&1 || true
         else
-            chcpu -d {num_threads}-$max_cpu >/dev/null 2>&1 || true
+            chcpu -e 0-$(({num_threads} - 1)) >/dev/null 2>&1 || true
         fi
-    fi
-    sleep 0.5
+        if [ {num_threads} -le $max_cpu ]; then
+            if [ {num_threads} -eq $max_cpu ]; then
+                chcpu -d {num_threads} >/dev/null 2>&1 || true
+            else
+                chcpu -d {num_threads}-$max_cpu >/dev/null 2>&1 || true
+            fi
+        fi
+        sleep 0.5
+        """
+    else:
+        chcpu_cmd = f"""
+        if [ {num_threads} -eq 1 ]; then
+            chcpu -e 0 >/dev/null 2>&1 || true
+        else
+            chcpu -e 0-$(({num_threads} - 1)) >/dev/null 2>&1 || true
+        fi
+        """
+
+    script = f"""
+    # 1. Dynamic CPU online/offline
+    {chcpu_cmd}
 
     # 2. Configure combined queues now that all required CPUs are online
     ethtool -L {server_ifname} combined {num_threads} 2>/dev/null || true
@@ -205,10 +288,14 @@ def configure_server_cores_and_queues(server_host, server_ifname, num_threads):
     ethtool -C {server_ifname} adaptive-rx off rx-usecs 0 2>/dev/null || true
     sleep 0.5
 
-    # 3. Pin IRQs 1-to-1 to active CPUs (Queue 0 -> CPU 0, Queue 1 -> CPU 1, etc.)
+    # 3. Pin IRQs 1-to-1 to active CPUs (filtering for TxRx queues to avoid misc/admin offset)
     systemctl stop irqbalance 2>/dev/null || true
+    irqs=$(grep -E "{server_ifname}-TxRx|{server_ifname}-rx|{server_ifname}.*TxRx" /proc/interrupts | awk '{{print $1}}' | tr -d ':')
+    if [ -z "$irqs" ]; then
+        irqs=$(grep "{server_ifname}" /proc/interrupts | awk '{{print $1}}' | tr -d ':')
+    fi
     q=0
-    for irq in $(grep {server_ifname} /proc/interrupts | awk '{{print $1}}' | tr -d ':'); do
+    for irq in $irqs; do
         target_cpu=$((q % {num_threads}))
         echo $target_cpu > /proc/irq/$irq/smp_affinity_list 2>/dev/null || true
         q=$((q + 1))
@@ -286,7 +373,7 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     time.sleep(1)
 
     # 2. Configure server hardware & queues
-    configure_server_cores_and_queues(args.server, args.server_ifname, num_threads)
+    configure_server_cores_and_queues(args.server, args.server_ifname, num_threads, offline_cpus=getattr(args, "offline_cpus", False))
 
     # 3. Start server classifier program with handshake on [CLASSIFIER_READY]
     taskset_prefix = "taskset -c 0 " if num_threads == 1 else ""
@@ -343,8 +430,10 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
         print("    [OK] Classifier attached to XDP and actively running.")
 
     # 4. Start client pktgen traffic
-    print(f"[*] Starting client pktgen (Interval: {interval_us}us, Threads: {num_threads})...")
-    start_pktgen(args.client, args.client_ifname, args.server_ip, args.server_mac, interval_us, num_threads=num_threads)
+    client_workers = getattr(args, "client_threads", None) or num_threads
+    print(f"[*] Starting client pktgen (Interval: {interval_us}us, DUT Threads: {num_threads}, Client Workers: {client_workers})...")
+    rate_limit = getattr(args, "rate_limit", 0)
+    start_pktgen(args.client, args.client_ifname, args.server_ip, args.server_mac, interval_us, num_threads=client_workers, rate_limit=rate_limit)
     time.sleep(1)
 
     # 5. Measure CPU utilization with mpstat on server for TEST_DURATION seconds
@@ -473,6 +562,12 @@ def main():
                         help="Models to test (default: dt, filter)")
     parser.add_argument("--threads", nargs="+", type=int, default=[1],
                         help="Thread / Core counts to test (default: 1)")
+    parser.add_argument("--client-threads", type=int, default=None,
+                        help="Number of pktgen worker threads on Client (default: matches --threads count)")
+    parser.add_argument("--offline-cpus", action="store_true", default=False,
+                        help="Dynamically offline unused CPUs via chcpu (default: False; keep False on baremetal to prevent APIC vector exhaustion)")
+    parser.add_argument("--rate-limit", type=int, default=0,
+                        help="Optional artificial rate limit in pps (default: 0 = unconstrained 10GbE wire speed; set to 800000 for legacy paper comparison)")
     parser.add_argument("--intervals", nargs="+", type=int, default=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
                         help="Packet sending intervals in us (default: 0 through 10)")
     parser.add_argument("--quick", action="store_true", 
