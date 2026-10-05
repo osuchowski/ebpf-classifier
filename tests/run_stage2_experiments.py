@@ -316,8 +316,11 @@ def configure_server_cores_and_queues(server_host, server_ifname, num_threads, s
     # 1. Dynamic CPU online/offline
     {chcpu_cmd}
 
-    # 2. Configure combined queues now that all required CPUs are online
+    # 2. Configure combined queues, balance hardware RSS table equally, and enable 4-tuple UDP hash
     ethtool -L {server_ifname} combined {num_threads} 2>/dev/null || true
+    ethtool -X {server_ifname} equal {num_threads} 2>/dev/null || true
+    ethtool -K {server_ifname} ntuple off 2>/dev/null || true
+    ethtool -N {server_ifname} rx-flow-hash udp4 sdfn 2>/dev/null || ethtool -U {server_ifname} rx-flow-hash udp4 sdfn 2>/dev/null || true
     ethtool -G {server_ifname} rx 4096 tx 4096 2>/dev/null || true
     ethtool -C {server_ifname} adaptive-rx off rx-usecs 0 2>/dev/null || true
     sleep 0.5
