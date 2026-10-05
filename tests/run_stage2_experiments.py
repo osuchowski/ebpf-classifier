@@ -10,6 +10,7 @@ Features:
 - Controls 'experiment' (Server) to configure NIC queues, CPU isolation, and eBPF/XDP programs.
 - Captures rxpps.log, txpps.log, and mpstat.json for CPU utilization breakdown.
 - Automatically aggregates results into a summary CSV for direct plotting in thesis.
+- NUMA-aware IRQ pinning and per-core SoftIRQ measurement on both Client and Server.
 """
 
 import os
@@ -98,36 +99,68 @@ def ssh_popen(host, command):
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ==============================================================================
-# CLIENT (PKTGEN) CONTROL
+# NUMA TOPOLOGY DISCOVERY & CLIENT (PKTGEN) CONTROL
 # ==============================================================================
+_NUMA_CPU_CACHE = {}
+
+def _parse_cpulist(cpulist_str):
+    """Parses a Linux sysfs cpulist string (e.g. '0-27,56-83' or '0,2,4') into a list of ints."""
+    cpus = []
+    if not cpulist_str:
+        return cpus
+    for part in cpulist_str.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                start, end = map(int, part.split("-"))
+                cpus.extend(range(start, end + 1))
+            except ValueError:
+                pass
+        elif part.isdigit():
+            cpus.append(int(part))
+    return cpus
+
 def get_remote_numa_cpus(host, ifname, count=1):
     """Discovers the NUMA node for a given network interface on host,
     and returns a list of CPU IDs belonging to that NUMA node/socket.
     Prefers physical cores over sibling hyperthreads when possible."""
-    script = f"""
-    node=$(cat /sys/class/net/{ifname}/device/numa_node 2>/dev/null || echo 0)
-    if [ -z "$node" ] || [ "$node" -lt 0 ] 2>/dev/null; then node=0; fi
-    cat /sys/devices/system/node/node${{node}}/cpulist 2>/dev/null || echo "0"
-    """
-    res = ssh_exec(host, script, capture=True)
-    cpus = []
-    if res:
-        for part in res.strip().split(","):
-            part = part.strip()
-            if "-" in part:
-                try:
-                    start, end = map(int, part.split("-"))
-                    cpus.extend(range(start, end + 1))
-                except ValueError:
-                    pass
-            elif part.isdigit():
-                cpus.append(int(part))
-    if not cpus:
-        cpus = list(range(max(count, 1)))
+    key = (host, ifname)
+    if key not in _NUMA_CPU_CACHE:
+        script = f"""
+        node=$(cat /sys/class/net/{ifname}/device/numa_node 2>/dev/null || echo 0)
+        if [ -z "$node" ] || [ "$node" -lt 0 ] 2>/dev/null; then node=0; fi
+        if [ -f "/sys/devices/system/node/node${{node}}/cpulist" ]; then
+            cat /sys/devices/system/node/node${{node}}/cpulist 2>/dev/null
+        else
+            cat /sys/devices/system/cpu/online 2>/dev/null || echo "0-$(($(nproc --all 2>/dev/null || echo 1) - 1))"
+        fi
+        """
+        res = ssh_exec(host, script, capture=True)
+        cpus = _parse_cpulist(res)
+        if not cpus:
+            cpus = list(range(max(count, 1)))
+        _NUMA_CPU_CACHE[key] = cpus
 
-    if count <= len(cpus):
-        return cpus[:count]
-    return cpus
+    all_cpus = list(_NUMA_CPU_CACHE[key])
+    if count <= len(all_cpus):
+        return all_cpus[:count]
+
+    # If requested count exceeds single-socket/node core count, retrieve all online CPUs to avoid truncation
+    sys_key = (host, "__all_online_cpus__")
+    if sys_key not in _NUMA_CPU_CACHE:
+        res = ssh_exec(host, "cat /sys/devices/system/cpu/online 2>/dev/null || echo 0", capture=True)
+        sys_cpus = _parse_cpulist(res)
+        if not sys_cpus:
+            sys_cpus = list(range(count))
+        _NUMA_CPU_CACHE[sys_key] = sys_cpus
+
+    all_system = _NUMA_CPU_CACHE[sys_key]
+    combined = all_cpus + [c for c in all_system if c not in all_cpus]
+    if count <= len(combined):
+        return combined[:count]
+    return combined
 
 def stop_pktgen(client_host):
     """Stops and clears all active pktgen workers across all CPUs on Client."""
@@ -186,13 +219,14 @@ def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us,
             pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
 
         # Multi-queue TX mapping and UDP flow entropy
+        # 16 flows per queue -> max 256 flows across 16 queues (comfortably fits in 1024-entry BPF sessions table)
         if actual_threads > 1:
             q_map_cmd = f"""
             echo 'queue_map_min {q_idx}' > /proc/net/pktgen/{dev_alias}
             echo 'queue_map_max {q_idx}' > /proc/net/pktgen/{dev_alias}
             """
-            udp_src_min = 10000 + q_idx * 100
-            udp_src_max = 10099 + q_idx * 100
+            udp_src_min = 10000 + q_idx * 16
+            udp_src_max = 10000 + q_idx * 16 + 15
         else:
             q_map_cmd = ""
             udp_src_min = 10000
@@ -249,33 +283,33 @@ def cleanup_server(server_host, server_ifname):
     """
     ssh_exec(server_host, script, check=False)
 
-def configure_server_cores_and_queues(server_host, server_ifname, num_threads, offline_cpus=False):
-    """Sets CPU isolation and NIC queue counts matching the thread configuration."""
+def configure_server_cores_and_queues(server_host, server_ifname, num_threads, server_cpus=None, offline_cpus=False):
+    """Sets CPU isolation and NIC queue counts matching the thread configuration,
+    strictly pinning IRQs to the CPUs on the NUMA node where the server NIC is located."""
+    if server_cpus is None:
+        server_cpus = get_remote_numa_cpus(server_host, server_ifname, count=num_threads)
+
+    cpus_comma = ",".join(str(c) for c in server_cpus)
+    cpus_space = " ".join(str(c) for c in server_cpus)
+
     chcpu_cmd = ""
     if offline_cpus:
         chcpu_cmd = f"""
+        # Ensure target test CPUs are online
+        chcpu -e {cpus_comma} >/dev/null 2>&1 || true
+        # Attempt to disable non-target CPUs
         max_cpu=$(($(nproc --all 2>/dev/null || echo 4) - 1))
-        if [ {num_threads} -eq 1 ]; then
-            chcpu -e 0 >/dev/null 2>&1 || true
-        else
-            chcpu -e 0-$(({num_threads} - 1)) >/dev/null 2>&1 || true
-        fi
-        if [ {num_threads} -le $max_cpu ]; then
-            if [ {num_threads} -eq $max_cpu ]; then
-                chcpu -d {num_threads} >/dev/null 2>&1 || true
-            else
-                chcpu -d {num_threads}-$max_cpu >/dev/null 2>&1 || true
-            fi
-        fi
+        for ((c=0; c<=max_cpu; c++)); do
+            case ",{cpus_comma}," in
+                *",$c,"*) ;;
+                *) chcpu -d $c >/dev/null 2>&1 || true ;;
+            esac
+        done
         sleep 0.5
         """
     else:
         chcpu_cmd = f"""
-        if [ {num_threads} -eq 1 ]; then
-            chcpu -e 0 >/dev/null 2>&1 || true
-        else
-            chcpu -e 0-$(({num_threads} - 1)) >/dev/null 2>&1 || true
-        fi
+        chcpu -e {cpus_comma} >/dev/null 2>&1 || true
         """
 
     script = f"""
@@ -288,15 +322,22 @@ def configure_server_cores_and_queues(server_host, server_ifname, num_threads, o
     ethtool -C {server_ifname} adaptive-rx off rx-usecs 0 2>/dev/null || true
     sleep 0.5
 
-    # 3. Pin IRQs 1-to-1 to active CPUs (filtering for TxRx queues to avoid misc/admin offset)
+    # 3. Pin IRQs 1-to-1 to active CPUs on the NIC's NUMA node
     systemctl stop irqbalance 2>/dev/null || true
-    irqs=$(grep -E "{server_ifname}-TxRx|{server_ifname}-rx|{server_ifname}.*TxRx" /proc/interrupts | awk '{{print $1}}' | tr -d ':')
+    irqs=$(grep -E "{server_ifname}-TxRx|{server_ifname}-rx|{server_ifname}.*TxRx" /proc/interrupts | grep -v -i "misc" | awk '{{print $1}}' | tr -d ':')
+    if [ -z "$irqs" ]; then
+        irqs=$(grep "{server_ifname}" /proc/interrupts | grep -v -i "misc" | awk '{{print $1}}' | tr -d ':')
+    fi
     if [ -z "$irqs" ]; then
         irqs=$(grep "{server_ifname}" /proc/interrupts | awk '{{print $1}}' | tr -d ':')
     fi
+
+    target_cpus=({cpus_space})
+    num_target_cpus=${{#target_cpus[@]}}
     q=0
     for irq in $irqs; do
-        target_cpu=$((q % {num_threads}))
+        idx=$((q % num_target_cpus))
+        target_cpu=${{target_cpus[$idx]}}
         echo $target_cpu > /proc/irq/$irq/smp_affinity_list 2>/dev/null || true
         q=$((q + 1))
     done
@@ -304,10 +345,11 @@ def configure_server_cores_and_queues(server_host, server_ifname, num_threads, o
     ssh_exec(server_host, script, check=False)
 
 def restore_server_cores(server_host):
-    """Re-enables all CPU cores on the server upon test suite completion."""
+    """Re-enables all CPU cores on the server and restarts irqbalance upon test suite completion."""
     script = """
     max_cpu=$(($(nproc --all 2>/dev/null || echo 4) - 1))
     chcpu -e 0-$max_cpu 2>/dev/null || true
+    systemctl start irqbalance 2>/dev/null || true
     """
     ssh_exec(server_host, script, check=False)
 
@@ -345,9 +387,9 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     print(f"    Mode: {mode} | ML Model: {ml_model} | Threads: {num_threads} | Interval: {interval_us}us")
     print(f"================================================================================")
 
-    # Define remote directories on server
+    # Define remote directories on server and clean any stale logs from previous trials
     remote_logdir = f"{args.server_repo_path}/results/stage2/{mode}/{ml_model}/{num_threads}threads/u{interval_us}"
-    ssh_exec(args.server, f"mkdir -p {remote_logdir}")
+    ssh_exec(args.server, f"rm -rf {remote_logdir} && mkdir -p {remote_logdir}")
 
     # Determine server program script path and flag
     flag = ""
@@ -372,11 +414,20 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     cleanup_server(args.server, args.server_ifname)
     time.sleep(1)
 
-    # 2. Configure server hardware & queues
-    configure_server_cores_and_queues(args.server, args.server_ifname, num_threads, offline_cpus=getattr(args, "offline_cpus", False))
+    # 2. Discover server NUMA cores and configure server hardware & queues
+    server_cpus = get_remote_numa_cpus(args.server, args.server_ifname, count=num_threads)
+    print(f"    [*] Server NUMA binding: {len(server_cpus)} core(s) on Socket CPUs: {server_cpus}")
+    configure_server_cores_and_queues(
+        args.server,
+        args.server_ifname,
+        num_threads,
+        server_cpus=server_cpus,
+        offline_cpus=getattr(args, "offline_cpus", False)
+    )
 
     # 3. Start server classifier program with handshake on [CLASSIFIER_READY]
-    taskset_prefix = "taskset -c 0 " if num_threads == 1 else ""
+    # For 1 thread, pin directly to the primary NUMA core; for multi-thread, allow socket distribution
+    taskset_prefix = f"taskset -c {server_cpus[0]} " if num_threads == 1 else ""
     classifier_log = f"{remote_logdir}/classifier.log"
     pid_file = f"{remote_logdir}/classifier.pid"
 
@@ -413,12 +464,14 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
         print("--------------------------------------------------------------")
         stop_pktgen(args.client)
         cleanup_server(args.server, args.server_ifname)
+        rate_limit = getattr(args, "rate_limit", 0)
+        eff_rate = rate_limit if (rate_limit > 0 and interval_us == 0) else INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0)
         return {
             "mode": mode,
             "ml_model": ml_model,
             "num_threads": num_threads,
             "interval_us": interval_us,
-            "target_ratep": INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0),
+            "target_ratep": eff_rate,
             "mean_rxpps": 0.0,
             "std_rxpps": 0.0,
             "cpu_soft_pct": 0.0,
@@ -437,8 +490,9 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     time.sleep(1)
 
     # 5. Measure CPU utilization with mpstat on server for TEST_DURATION seconds
-    print(f"[*] Monitoring execution for {args.duration} seconds via mpstat...")
-    mpstat_cmd = f"mpstat -P ALL 1 {args.duration} -o JSON > {remote_logdir}/mpstat.json"
+    # Monitor strictly the active cores assigned to the experiment to avoid dilution across all online cores
+    print(f"[*] Monitoring execution for {args.duration} seconds via mpstat (cores {server_cpus})...")
+    mpstat_cmd = f"mpstat -P {','.join(str(c) for c in server_cpus)} 1 {args.duration} -o JSON > {remote_logdir}/mpstat.json"
     ssh_exec(args.server, mpstat_cmd, check=False)
 
     # 6. Stop client pktgen first so no flood interrupts hit during shutdown, then stop classifier
@@ -448,34 +502,54 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     ssh_exec(args.server, f"if [ -f {pid_file} ]; then kill -SIGINT $(cat {pid_file}) 2>/dev/null || true; sleep 1.5; fi", check=False)
     cleanup_server(args.server, args.server_ifname)
 
-    # 7. Download results from server
+    # 7. Download results from server (ensuring a clean local trial directory)
     local_trial_dir = Path(args.local_results_dir) / mode / ml_model / f"{num_threads}threads" / f"u{interval_us}"
+    if local_trial_dir.exists():
+        import shutil
+        shutil.rmtree(local_trial_dir)
     local_trial_dir.mkdir(parents=True, exist_ok=True)
     
     scp_cmd = f"scp -r {args.server}:{remote_logdir}/* {local_trial_dir}/"
     subprocess.run(scp_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 8. Parse trial throughput summary (dual parsing: rxpps.log primary, classifier.log fallback)
+    # 8. Parse trial throughput summary
+    # Extract candidate rate series from both rxpps.log and classifier.log.
+    # Unbuffered stdout (classifier.log) is streamed in real-time every second,
+    # making it resilient against process-exit truncations that can affect rxpps.log.
     rxpps_file = local_trial_dir / "rxpps.log"
     classifier_log_file = local_trial_dir / "classifier.log"
     mean_rx, std_rx = 0.0, 0.0
-    rates = []
-
+    
+    rx_rates = []
     if rxpps_file.exists():
         try:
-            rates = [float(line.strip()) for line in rxpps_file.read_text().splitlines() if line.strip().replace('.', '', 1).isdigit()]
+            rx_rates = [
+                float(line.strip())
+                for line in rxpps_file.read_text().splitlines()
+                if line.strip().replace('.', '', 1).isdigit()
+            ]
         except Exception as e:
             print(f"[!] Warning: Could not parse rxpps.log: {e}")
 
-    # Fallback to parsing classifier.log if rxpps.log was not produced
-    if not rates and classifier_log_file.exists():
+    c_rates = []
+    if classifier_log_file.exists():
         try:
             for line in classifier_log_file.read_text().splitlines():
                 parts = line.strip().split()
                 if parts and parts[-1].isdigit():
-                    rates.append(float(parts[-1]))
+                    c_rates.append(float(parts[-1]))
         except Exception as e:
             print(f"[!] Warning: Could not parse classifier.log: {e}")
+
+    # Select the most complete time series:
+    # If classifier.log has more samples than rxpps.log, prioritize it to avoid
+    # truncated or stale partial writes from rxpps.log.
+    if len(c_rates) >= len(rx_rates) and len(c_rates) > 0:
+        rates = c_rates
+        if rx_rates and len(rx_rates) < len(c_rates):
+            print(f"    [*] Notice: Prioritizing complete classifier.log ({len(c_rates)} samples) over truncated rxpps.log ({len(rx_rates)} samples).")
+    else:
+        rates = rx_rates
 
     if rates:
         # Discard first 2 warmup seconds
@@ -496,7 +570,7 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
         else:
             print(f"    [Diagnostic] rxpps.log does not exist.")
 
-    # Parse CPU softirq usage from mpstat.json
+    # 9. Parse CPU softirq usage from mpstat.json, strictly filtering and averaging active server_cpus
     cpu_soft = 0.0
     per_core_info = ""
     mpstat_file = local_trial_dir / "mpstat.json"
@@ -506,32 +580,46 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
             hosts = mp_data.get("sysstat", {}).get("hosts", [])
             if hosts:
                 stats = hosts[0].get("statistics", [])
-                soft_vals = [entry.get("cpu-load", [{}])[0].get("soft", 0.0) for entry in stats if entry.get("cpu-load")]
-                if soft_vals:
-                    cpu_soft = sum(soft_vals) / len(soft_vals)
+                target_cpu_strs = {str(c) for c in server_cpus}
+                sec_averages = []
+                per_core_soft = {str(c): [] for c in server_cpus}
 
-                # Per-core softirq breakdown for multi-core verification
-                per_core_soft = {}
                 for entry in stats:
-                    for c_load in entry.get("cpu-load", [])[1:]:
-                        c_id = c_load.get("cpu")
-                        if c_id not in per_core_soft:
-                            per_core_soft[c_id] = []
-                        per_core_soft[c_id].append(c_load.get("soft", 0.0))
-                if per_core_soft:
-                    per_core_info = " (" + ", ".join(f"CPU{k}: {sum(v)/len(v):.1f}%" for k, v in sorted(per_core_soft.items())) + ")"
+                    sec_core_vals = []
+                    for c_load in entry.get("cpu-load", []):
+                        c_id = str(c_load.get("cpu"))
+                        if c_id in target_cpu_strs:
+                            val = float(c_load.get("soft", 0.0))
+                            sec_core_vals.append(val)
+                            per_core_soft[c_id].append(val)
+                    if sec_core_vals:
+                        sec_averages.append(sum(sec_core_vals) / len(sec_core_vals))
+
+                if sec_averages:
+                    cpu_soft = sum(sec_averages) / len(sec_averages)
+
+                # Format per-core breakdown string (only for the target cores under test)
+                active_cores_summary = []
+                for c in server_cpus:
+                    c_str = str(c)
+                    vals = per_core_soft.get(c_str, [])
+                    if vals:
+                        active_cores_summary.append(f"CPU{c}: {sum(vals)/len(vals):.1f}%")
+                if active_cores_summary:
+                    per_core_info = " (" + ", ".join(active_cores_summary) + ")"
         except Exception as e:
-            pass
+            print(f"[!] Warning: Could not parse mpstat.json: {e}")
 
     print(f"[+] Result: RX Throughput: {mean_rx:,.0f} pps (std: {std_rx:,.0f}) | CPU SoftIRQ: {cpu_soft:.1f}%{per_core_info}")
     time.sleep(args.cooldown)
 
+    eff_rate = rate_limit if (rate_limit > 0 and interval_us == 0) else INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0)
     return {
         "mode": mode,
         "ml_model": ml_model,
         "num_threads": num_threads,
         "interval_us": interval_us,
-        "target_ratep": INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0),
+        "target_ratep": eff_rate,
         "mean_rxpps": mean_rx,
         "std_rxpps": std_rx,
         "cpu_soft_pct": cpu_soft
@@ -585,7 +673,7 @@ def main():
         args.intervals = [0, 5]
         print("[!] QUICK SMOKE TEST MODE ACTIVATED (7s per test, limited intervals)")
 
-    # Pre-flight check: ensure SSH connections work and check dependencies
+    # Pre-flight check: ensure SSH connections work, check dependencies, and display NUMA topology
     print("[*] Pre-flight check: Testing SSH connections & remote environment...")
     try:
         c_uname = ssh_exec(args.client, "uname -r", capture=True)
@@ -608,6 +696,15 @@ def main():
             print("    [!] Warning: 'bcc' is NOT installed on server! Run 'dnf install -y bcc-tools python3-bcc' on server.")
         else:
             print(f"    [OK] Server Python environment: bcc and numpy verified.")
+
+        # Probe NUMA topology on Client and Server
+        c_node = ssh_exec(args.client, f"cat /sys/class/net/{args.client_ifname}/device/numa_node 2>/dev/null || echo 0", capture=True)
+        s_node = ssh_exec(args.server, f"cat /sys/class/net/{args.server_ifname}/device/numa_node 2>/dev/null || echo 0", capture=True)
+        max_threads = max(args.threads) if args.threads else 1
+        c_cpus = get_remote_numa_cpus(args.client, args.client_ifname, count=max_threads)
+        s_cpus = get_remote_numa_cpus(args.server, args.server_ifname, count=max_threads)
+        print(f"    [OK] Client ({args.client}) NIC '{args.client_ifname}': NUMA Node {c_node} | Socket CPUs: {c_cpus}")
+        print(f"    [OK] Server ({args.server}) NIC '{args.server_ifname}': NUMA Node {s_node} | Socket CPUs: {s_cpus}")
     except Exception as e:
         print(f"[!] Pre-flight SSH check failed: {e}")
         print("    Please ensure 'ssh client' and 'ssh server' work passwordlessly from this machine.")
@@ -657,4 +754,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
