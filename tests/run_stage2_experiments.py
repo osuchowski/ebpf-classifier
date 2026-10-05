@@ -182,15 +182,25 @@ def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us,
     Supports single-flow baseline (num_threads=1) or multi-queue RSS entropy (num_threads > 1)."""
     cfg = INTERVAL_CONFIGS.get(interval_us, {"ratep": 0, "delay_ns": 0, "expected_pps": 14880952})
     delay_ns = cfg.get("delay_ns", 0)
-    ratep = rate_limit if rate_limit > 0 else cfg.get("ratep", 0)
+    expected_pps = cfg.get("expected_pps", 14880952)
 
     # Discover CPUs on the socket/NUMA node owning client_ifname
     target_cpus = get_remote_numa_cpus(client_host, client_ifname, count=num_threads)
     actual_threads = len(target_cpus)
     print(f"    [*] Client NUMA binding: {actual_threads} worker(s) pinned to Socket CPUs: {target_cpus}")
 
-    # Determine per-thread pacing rate if ratep is set
-    ratep_per_thread = max(1, ratep // actual_threads) if ratep > 0 else 0
+    # Log pacing strategy
+    if interval_us == 0:
+        if rate_limit > 0:
+            print(f"    [*] Pktgen mode: Rate-limited flood ({rate_limit:,} pps cap across {actual_threads} worker(s))")
+        else:
+            print(f"    [*] Pktgen mode: Unconstrained wire flood (burst 32, delay 0)")
+    else:
+        if rate_limit > 0 and expected_pps > rate_limit:
+            print(f"    [*] Pktgen mode: Rate-limited interval {interval_us}us (capped to {rate_limit:,} pps from {expected_pps:,} pps)")
+        else:
+            thread_delay_ns = delay_ns * actual_threads
+            print(f"    [*] Pktgen mode: Interval-paced ({interval_us}us -> target {expected_pps:,} pps, thread delay: {thread_delay_ns}ns)")
 
     thread_setup_cmds = []
     for q_idx, cpu in enumerate(target_cpus):
@@ -198,25 +208,33 @@ def start_pktgen(client_host, client_ifname, server_ip, server_mac, interval_us,
 
         # Pacing and burst settings:
         # In flood mode (interval_us == 0):
-        # - Use burst 32 (skb->xmit_more batching) with clone_skb 0 for maximum line rate.
-        # When delay pacing is requested (interval_us > 0):
-        # - Use burst 0 and clone_skb 0 so each packet respects the inter-packet gap.
+        # - When rate_limit is set, cap to rate_limit with burst 0.
+        # - Otherwise, use burst 32 (skb->xmit_more batching) with clone_skb 0 for maximum line rate.
+        # In interval mode (interval_us > 0):
+        # - When rate_limit is set and expected_pps > rate_limit (e.g. Is = 1us with 800k limit),
+        #   cap to rate_limit per thread.
+        # - Otherwise, pace by interval delay (delay_ns * actual_threads).
         if interval_us == 0:
-            burst_cmd = f"echo 'burst 32' > /proc/net/pktgen/{dev_alias}"
-            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
-            pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
-        elif ratep_per_thread > 0:
-            burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
-            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
-            pacing_cmd = f"echo 'ratep {ratep_per_thread}' > /proc/net/pktgen/{dev_alias}"
-        elif delay_ns > 0:
-            burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
-            clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
-            pacing_cmd = f"echo 'delay {delay_ns}' > /proc/net/pktgen/{dev_alias}"
+            if rate_limit > 0:
+                ratep_per_thread = max(1, rate_limit // actual_threads)
+                burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
+                clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
+                pacing_cmd = f"echo 'ratep {ratep_per_thread}' > /proc/net/pktgen/{dev_alias}"
+            else:
+                burst_cmd = f"echo 'burst 32' > /proc/net/pktgen/{dev_alias}"
+                clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
+                pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
         else:
             burst_cmd = f"echo 'burst 0' > /proc/net/pktgen/{dev_alias}"
             clone_cmd = f"echo 'clone_skb 0' > /proc/net/pktgen/{dev_alias}"
-            pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
+            if rate_limit > 0 and expected_pps > rate_limit:
+                ratep_per_thread = max(1, rate_limit // actual_threads)
+                pacing_cmd = f"echo 'ratep {ratep_per_thread}' > /proc/net/pktgen/{dev_alias}"
+            elif delay_ns > 0:
+                thread_delay_ns = delay_ns * actual_threads
+                pacing_cmd = f"echo 'delay {thread_delay_ns}' > /proc/net/pktgen/{dev_alias}"
+            else:
+                pacing_cmd = f"echo 'delay 0' > /proc/net/pktgen/{dev_alias}"
 
         # Multi-queue TX mapping and UDP flow entropy
         # 16 flows per queue -> max 256 flows across 16 queues (comfortably fits in 1024-entry BPF sessions table)
@@ -468,7 +486,8 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
         stop_pktgen(args.client)
         cleanup_server(args.server, args.server_ifname)
         rate_limit = getattr(args, "rate_limit", 0)
-        eff_rate = rate_limit if (rate_limit > 0 and interval_us == 0) else INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0)
+        expected_pps = INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0)
+        eff_rate = min(expected_pps, rate_limit) if rate_limit > 0 else expected_pps
         return {
             "mode": mode,
             "ml_model": ml_model,
@@ -616,7 +635,8 @@ def run_single_trial(args, mode, ml_model, num_threads, interval_us):
     print(f"[+] Result: RX Throughput: {mean_rx:,.0f} pps (std: {std_rx:,.0f}) | CPU SoftIRQ: {cpu_soft:.1f}%{per_core_info}")
     time.sleep(args.cooldown)
 
-    eff_rate = rate_limit if (rate_limit > 0 and interval_us == 0) else INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0)
+    expected_pps = INTERVAL_CONFIGS.get(interval_us, {}).get("expected_pps", 0)
+    eff_rate = min(expected_pps, rate_limit) if rate_limit > 0 else expected_pps
     return {
         "mode": mode,
         "ml_model": ml_model,
